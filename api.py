@@ -1,29 +1,19 @@
-from typing import Optional
-from pydantic import BaseModel
+import jwt
+import os
+import secrets
+import shelve
+
+from datetime import datetime, timedelta
 
 from fastapi import Depends, FastAPI, HTTPException, Security
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 
-fake_users_db = {
-    'urma': {
-        'username': 'urma',
-        'full_name': 'Ulisses Albuquerque',
-        'email': 'ulisses.montenegro@gmail.com',
-        'hashed_password': 'fakehashedurma',
-        'disabled': False
-    },
-    'rvbc': {
-        'username': 'rvbc',
-        'full_name': 'Roberta Capobiango',
-        'email': 'roberta.capobiango@gmail.com',
-        'hashed_password': 'fakehashedrvbc',
-        'disabled': True
-    }
-}
+from pydantic import BaseModel
+from typing import Optional
 
-app = FastAPI()
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl='/token')
-
+###
+# Model definitions
+###
 class User(BaseModel):
     username: str
     email: Optional[str] = None
@@ -33,42 +23,44 @@ class User(BaseModel):
 class UserInDB(User):
     hashed_password: str
 
-def fake_hash_password(password: str):
-    return 'fakehashed' + password
+###
+# Helper methods
+###
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl='/token')
+jwt_key = secrets.token_bytes(64)
 
-def get_user(db, username: str):
-    if username in db:
-        user_dict = db[username]
-        return UserInDB(**user_dict)
+async def authenticate(username: str, password: str):
+    with shelve.open('userdb', 'c') as user_db:
+        if username in user_db and user_db[username].hashed_password == password:
+            user = User(**user_db[username].dict())
+            payload = {
+                'iss': 'datastore-api.local',
+                'exp': datetime.utcnow() + timedelta(minutes=30),
+                'sub': user.dict()
+            }
+            return jwt.encode(payload, jwt_key, algorithm='HS256')
+    return None
 
-def fake_decode_token(token):
-    user = get_user(fake_users_db, token)
-    print(user)
-    return user
+async def get_current_active_user(token: str = Security(oauth2_scheme)):
+    try:
+        payload = jwt.decode(token, jwt_key, [ 'HS256' ])
+        with shelve.open('userdb', 'c') as user_db:
+            return User(**user_db[payload['sub']['username']].dict())
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=403, detail='Invalid credentials')
 
-async def get_current_user(token: str = Security(oauth2_scheme)):
-    user = fake_decode_token(token)
-    if not user:
-        raise HTTPException(status_code=400, detail='Invalid authentication credentials')
-    return user
-
-async def get_current_active_user(current_user: User = Depends(get_current_user)):
-    if current_user.disabled:
-        raise HTTPException(status_code=400, detail='Inactive user')
-    return current_user
+###
+# Main API definitions and entrypoints
+###
+app = FastAPI()
 
 @app.post('/token')
 async def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    user_dict = fake_users_db.get(form_data.username)
-    if not user_dict:
+    access_token = await authenticate(form_data.username, form_data.password)
+    if access_token:
+        return { 'access_token': access_token, 'token_type': 'bearer' }
+    else:
         raise HTTPException(status_code=400, detail='Invalid username and/or password')
-
-    user = UserInDB(**user_dict)
-    hashed_password = fake_hash_password(form_data.password)
-    if not hashed_password == user.hashed_password:
-        raise HTTPException(status_code=400, detail='Invalid username and/or password')
-
-    return { 'access_token': user.username, 'token_type': 'bearer' }
 
 @app.get('/users/me')
 async def get_users_me(current_user: User = Depends(get_current_active_user)):
